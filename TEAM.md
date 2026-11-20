@@ -1,5 +1,5 @@
 # Team
 
-Name:
-Members:
+Name: Kalyan-Lankireddy
+Members: Kalyan-Lankireddy
 Engine: DuckDB
