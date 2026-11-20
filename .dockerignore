@@ -1,0 +1,9 @@
+fixtures/
+dev/
+out/
+scratch/
+tests/
+__pycache__/
+.pytest_cache/
+*.md
+.git

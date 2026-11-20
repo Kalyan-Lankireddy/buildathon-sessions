@@ -1,0 +1,16 @@
+# data and outputs (never commit)
+dev/
+out/
+output/
+scratch/
+*.parquet
+*.csv
+# ...except the fixture files the scripts need
+!fixtures/**/*.csv
+
+# python / tooling
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
