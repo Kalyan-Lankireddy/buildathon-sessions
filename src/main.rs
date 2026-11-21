@@ -4,6 +4,7 @@
 //!   read+parse -> dedup -> links -> sessions -> credit+assists -> aggregate -> write
 //! Per-stage wall times go to stderr.
 
+mod alloc;
 mod credit;
 mod csv;
 mod dedup;
@@ -25,6 +26,9 @@ use rayon::prelude::*;
 use std::time::Instant;
 use ts::{MS_DAY, WEEK_MS};
 use util::{bits_for, concat_par, sort_by_key_bucketed, SyncPtr};
+
+#[global_allocator]
+static GLOBAL: alloc::HugeAlloc = alloc::HugeAlloc;
 
 const CHUNK: usize = 64 << 20;
 
@@ -83,15 +87,15 @@ fn main() {
     // ---- read + parse
     let d = dims::load(&data);
     let (ws, we) = (d.window_start, d.window_end);
-    let ev_chunks = csv::load_chunks(&csv::list_csv(&format!("{data}/events")), CHUNK);
-    let ck_chunks = csv::load_chunks(&csv::list_csv(&format!("{data}/clicks")), CHUNK);
-    let lk_chunks = csv::load_chunks(&csv::list_csv(&format!("{data}/links")), CHUNK);
-    lap.lap("  map files");
-    let mut evs: Vec<Vec<Vec<parse::Ev>>> = ev_chunks.par_iter().map(|c| parse::parse_events(c, &d)).collect();
-    lap.lap("  parse events");
-    let mut cks: Vec<Vec<Vec<parse::Ck>>> = ck_chunks.par_iter().map(|c| parse::parse_clicks(c, &d)).collect();
-    let lks: Vec<Vec<parse::Link>> = lk_chunks.par_iter().map(|c| parse::parse_links(c)).collect();
-    lap.lap("  parse clicks+links");
+    // pread each piece into a huge-page buffer and parse it right away
+    let mut evs: Vec<Vec<Vec<parse::Ev>>> =
+        csv::read_map(&csv::list_csv(&format!("{data}/events")), CHUNK, |c| parse::parse_events(c, &d));
+    lap.lap("  read+parse events");
+    let mut cks: Vec<Vec<Vec<parse::Ck>>> =
+        csv::read_map(&csv::list_csv(&format!("{data}/clicks")), CHUNK, |c| parse::parse_clicks(c, &d));
+    let lks: Vec<Vec<parse::Link>> =
+        csv::read_map(&csv::list_csv(&format!("{data}/links")), CHUNK, parse::parse_links);
+    lap.lap("  read+parse clicks+links");
 
     // ---- dedup in place (events: smallest ingest_ts wins; the kept copy's validity decides)
     dedup::dedup_in_place(&mut evs);

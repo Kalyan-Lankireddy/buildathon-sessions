@@ -61,11 +61,80 @@ pub fn chunks(file: B, target: usize) -> Vec<B> {
     out
 }
 
-/// Map every file and cut it into chunks.
-pub fn load_chunks(files: &[String], target: usize) -> Vec<B> {
+/// First `\n` at or after `from`, by 64 KB preads. `None` if there is none.
+fn find_newline(f: &File, len: u64, from: u64) -> Option<u64> {
+    use std::os::unix::fs::FileExt;
+    let mut buf = vec![0u8; 1 << 16];
+    let mut p = from;
+    while p < len {
+        let n = buf.len().min((len - p) as usize);
+        f.read_exact_at(&mut buf[..n], p).expect("read");
+        if let Some(i) = memchr(b'\n', &buf[..n]) {
+            return Some(p + i as u64);
+        }
+        p += n as u64;
+    }
+    None
+}
+
+/// Start of the first line that begins at or after `pos` (lines begin at `body` and after `\n`).
+fn line_start_at_or_after(f: &File, len: u64, body: u64, pos: u64) -> u64 {
+    if pos <= body {
+        return body;
+    }
+    match find_newline(f, len, pos - 1) {
+        Some(i) => i + 1,
+        None => len,
+    }
+}
+
+/// Read every file in pieces of about `target` bytes, each ending on a line boundary, and hand
+/// each piece to `f` as soon as it is read, while its bytes are still in cache. The header line
+/// of every file is skipped. Pieces are read with pread() into their own 2 MB-aligned buffers
+/// (no mmap, so no per-page faults on the input) and the buffers live for the whole run. The
+/// results come back in file order, then piece order.
+pub fn read_map<R: Send>(files: &[String], target: usize, f: impl Fn(B) -> R + Sync) -> Vec<R> {
     use rayon::prelude::*;
-    let per_file: Vec<Vec<B>> = files.par_iter().map(|f| chunks(map_file(f), target)).collect();
-    per_file.into_iter().flatten().collect()
+    use std::os::unix::fs::FileExt;
+    use std::sync::Arc;
+    struct Job {
+        file: Arc<File>,
+        a: u64,
+        b: u64,
+    }
+    let per_file: Vec<Vec<Job>> = files
+        .par_iter()
+        .map(|path| {
+            let file = Arc::new(File::open(path).unwrap_or_else(|e| panic!("open {path}: {e}")));
+            let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+            let Some(h) = find_newline(&file, len, 0) else { return vec![] };
+            let body = h + 1;
+            if body >= len {
+                return vec![];
+            }
+            let n = ((len - body) as usize).div_ceil(target).max(1);
+            let mut starts: Vec<u64> =
+                (0..n).map(|k| line_start_at_or_after(&file, len, body, body + (k * target) as u64)).collect();
+            starts.push(len);
+            (0..n)
+                .filter(|&k| starts[k] < starts[k + 1])
+                .map(|k| Job { file: file.clone(), a: starts[k], b: starts[k + 1] })
+                .collect()
+        })
+        .collect();
+    let jobs: Vec<Job> = per_file.into_iter().flatten().collect();
+    jobs.par_iter()
+        .map(|j| {
+            let n = (j.b - j.a) as usize;
+            let mut buf: Vec<u8> = Vec::with_capacity(n);
+            // SAFETY: the bytes are written by read_exact_at before anything reads them.
+            let dst = unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr(), n) };
+            j.file.read_exact_at(dst, j.a).expect("read input");
+            unsafe { buf.set_len(n) };
+            let leaked: B = Box::leak(buf.into_boxed_slice());
+            f(leaked)
+        })
+        .collect()
 }
 
 #[inline]
@@ -244,6 +313,54 @@ mod tests {
                 assert_eq!(got, want, "line {:?} n {}", String::from_utf8_lossy(leaked), n);
             }
         }
+    }
+
+    #[test]
+    fn read_map_covers_every_line_once() {
+        let dir = std::env::temp_dir().join(format!("rm_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            ("empty.csv", vec![]),
+            ("header_only.csv", b"a,b".to_vec()),
+            ("header_nl.csv", b"a,b\n".to_vec()),
+            ("one.csv", b"a,b\n1,2".to_vec()),
+            ("many.csv", {
+                let mut v = b"h,h\n".to_vec();
+                for i in 0..5000 {
+                    v.extend_from_slice(format!("{i},{}\n", "x".repeat(i % 37)).as_bytes());
+                }
+                v
+            }),
+            ("no_trailing_nl.csv", {
+                let mut v = b"h\n".to_vec();
+                for i in 0..777 {
+                    v.extend_from_slice(format!("line{i}\n").as_bytes());
+                }
+                v.extend_from_slice(b"last");
+                v
+            }),
+        ];
+        let mut paths = vec![];
+        for (name, bytes) in &cases {
+            let p = dir.join(name);
+            std::fs::write(&p, bytes).unwrap();
+            paths.push(p.to_string_lossy().into_owned());
+        }
+        for target in [1usize, 7, 64, 1000, 4096, 1 << 20] {
+            let pieces = read_map(&paths, target, |c| c.to_vec());
+            let got: Vec<u8> = pieces.concat();
+            let mut want = vec![];
+            for (_, bytes) in &cases {
+                if let Some(h) = bytes.iter().position(|&c| c == b'\n') {
+                    want.extend_from_slice(&bytes[h + 1..]);
+                }
+            }
+            assert_eq!(got, want, "target {target}");
+            for p in &pieces {
+                assert!(!p.is_empty());
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

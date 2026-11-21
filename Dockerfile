@@ -5,9 +5,9 @@
 # ---- builder: Rust 1.100.0 on Debian bookworm
 FROM rust:1.100.0-slim-bookworm@sha256:7c7d4eb4d05b7781187a327809466cfddf29753f6defdc3d19a0e291951b7a37 AS builder
 WORKDIR /src
-# cascadelake = AVX-512 (VL/BW/DQ/CD/VNNI); the scorer is Cascade Lake or newer. Not runnable on a Mac (Rosetta has no AVX-512), so this build is checked by the scorer, not locally.
+# x86-64-v3 = AVX2, safe on every Cascade Lake or newer Xeon.
 # (the arm64 build used for quick Linux timing loops on a Mac passes --build-arg RUSTFLAGS="")
-ARG RUSTFLAGS="-C target-cpu=cascadelake"
+ARG RUSTFLAGS="-C target-cpu=x86-64-v3"
 # An explicit --target makes RUSTFLAGS apply to our binary only, not to build scripts, which run
 # on the builder and must not need AVX-512 (the arm64 timing build passes aarch64-unknown-linux-gnu).
 ARG CARGO_TARGET=x86_64-unknown-linux-gnu
