@@ -1,10 +1,10 @@
 //! Row parsers for events, clicks and links. One pass over the bytes, no allocation per row.
 
-use crate::csv::{fields, for_each_line, B};
+use crate::csv::{fields, for_each_line, line_at, B};
 use crate::dedup::Rec;
 use crate::dims::Dims;
 use crate::ts::{digits_i64, parse_ts, LATE_MS, WEEK_MS};
-use crate::util::hash_bytes;
+use crate::util::{hash32, hash_bytes};
 
 pub const KIND_VIEW: u64 = 0;
 pub const KIND_CART: u64 = 1;
@@ -27,14 +27,33 @@ pub fn pay_cat(p: u64) -> u32 {
     (p >> 32) as u32
 }
 
+/// Records are routed into 2^SHARD_BITS hash shards while parsing, so dedup needs no copy.
+pub const SHARD_BITS: u32 = 8;
+pub const SHARDS: usize = 1 << SHARD_BITS;
+#[inline]
+pub fn shard_of(hash: u64) -> usize {
+    (hash >> (64 - SHARD_BITS)) as usize
+}
+
+/// 56 bytes. The event_id is stored as (pointer, length); the user_id as an offset from it plus
+/// its length and a 32-bit hash, all taken while the line is in cache.
 #[derive(Clone, Copy)]
 pub struct Ev {
     pub hash: u64,
     pub ingest: i64,
     pub ts: i64,
     pub pay: u64,
-    pub eid: B,
-    pub user: B,
+    eptr: usize,
+    elen: u32,
+    ulen: u32,
+    uhash: u32,
+    udelta: u32,
+}
+impl Ev {
+    #[inline]
+    pub fn eid(&self) -> B {
+        line_at(self.eptr, self.elen)
+    }
 }
 impl Rec for Ev {
     #[inline]
@@ -43,7 +62,7 @@ impl Rec for Ev {
     }
     #[inline]
     fn key(&self) -> B {
-        self.eid
+        self.eid()
     }
     #[inline]
     fn rank(&self) -> i64 {
@@ -51,17 +70,36 @@ impl Rec for Ev {
     }
 }
 
-/// A surviving event.
+/// A surviving event (32 bytes).
 #[derive(Clone, Copy)]
 pub struct EvOut {
-    pub user: B,
+    uptr: usize,
+    ulen: u32,
+    pub uhash: u32,
     pub ts: i64,
     pub pay: u64,
 }
+impl EvOut {
+    #[inline]
+    pub fn user(&self) -> B {
+        line_at(self.uptr, self.ulen)
+    }
+}
+impl Ev {
+    #[inline]
+    pub fn out(&self) -> EvOut {
+        EvOut { uptr: self.eptr + self.udelta as usize, ulen: self.ulen, uhash: self.uhash, ts: self.ts, pay: self.pay }
+    }
+}
 
-pub fn parse_events(chunk: B, d: &Dims) -> Vec<Ev> {
+fn shard_buffers<R>(chunk_len: usize, bytes_per_row: usize) -> Vec<Vec<R>> {
+    let per = chunk_len / bytes_per_row / SHARDS * 5 / 4 + 4;
+    (0..SHARDS).map(|_| Vec::with_capacity(per)).collect()
+}
+
+pub fn parse_events(chunk: B, d: &Dims) -> Vec<Vec<Ev>> {
     let (ws, we) = (d.window_start, d.window_end);
-    let mut out = Vec::with_capacity(chunk.len() / 56 + 16);
+    let mut out: Vec<Vec<Ev>> = shard_buffers(chunk.len(), 90);
     for_each_line(chunk, |line| {
         let Some([eid, user, tsr, ing, ty, prod, price]) = fields::<7>(line) else { return };
         if eid.is_empty() {
@@ -96,18 +134,43 @@ pub fn parse_events(chunk: B, d: &Dims) -> Vec<Ev> {
             ts = t;
             pay = p | (kind << 24) | (cat << 32);
         }
-        out.push(Ev { hash: hash_bytes(eid), ingest, ts, pay, eid, user });
+        let hash = hash_bytes(eid);
+        out[shard_of(hash)].push(Ev {
+            hash,
+            ingest,
+            ts,
+            pay,
+            eptr: eid.as_ptr() as usize,
+            elen: eid.len() as u32,
+            ulen: user.len() as u32,
+            uhash: hash32(user),
+            udelta: (user.as_ptr() as usize).wrapping_sub(eid.as_ptr() as usize) as u32,
+        });
     });
     out
 }
 
+/// A valid click (56 bytes), stored like `Ev`.
 #[derive(Clone, Copy)]
 pub struct Ck {
     pub hash: u64,
-    pub cid: B,
-    pub user: B,
-    pub camp: u32,
     pub ts: i64,
+    cptr: usize,
+    clen: u32,
+    ulen: u32,
+    pub uhash: u32,
+    udelta: u32,
+    pub camp: u32,
+}
+impl Ck {
+    #[inline]
+    pub fn cid(&self) -> B {
+        line_at(self.cptr, self.clen)
+    }
+    #[inline]
+    pub fn user(&self) -> B {
+        line_at(self.cptr + self.udelta as usize, self.ulen)
+    }
 }
 impl Rec for Ck {
     #[inline]
@@ -116,7 +179,7 @@ impl Rec for Ck {
     }
     #[inline]
     fn key(&self) -> B {
-        self.cid
+        self.cid()
     }
     #[inline]
     fn rank(&self) -> i64 {
@@ -126,9 +189,9 @@ impl Rec for Ck {
 
 /// Only valid clicks are kept: copies of a click are identical (rules.md), so dedup after
 /// validation gives the same set as dedup before it.
-pub fn parse_clicks(chunk: B, d: &Dims) -> Vec<Ck> {
+pub fn parse_clicks(chunk: B, d: &Dims) -> Vec<Vec<Ck>> {
     let (lo, hi) = (d.window_start - WEEK_MS, d.window_end);
-    let mut out = Vec::with_capacity(chunk.len() / 40 + 16);
+    let mut out: Vec<Vec<Ck>> = shard_buffers(chunk.len(), 60);
     for_each_line(chunk, |line| {
         let Some([cid, user, camp, tsr]) = fields::<4>(line) else { return };
         if cid.is_empty() || user.is_empty() {
@@ -139,17 +202,36 @@ pub fn parse_clicks(chunk: B, d: &Dims) -> Vec<Ck> {
         if ts < lo || ts >= hi {
             return;
         }
-        out.push(Ck { hash: hash_bytes(cid), cid, user, camp: c, ts });
+        let hash = hash_bytes(cid);
+        out[shard_of(hash)].push(Ck {
+            hash,
+            ts,
+            cptr: cid.as_ptr() as usize,
+            clen: cid.len() as u32,
+            ulen: user.len() as u32,
+            uhash: hash32(user),
+            udelta: (user.as_ptr() as usize).wrapping_sub(cid.as_ptr() as usize) as u32,
+            camp: c,
+        });
     });
     out
 }
 
-pub fn parse_links(chunk: B) -> Vec<(B, B)> {
+/// One valid link line: both IDs and their hashes.
+#[derive(Clone, Copy)]
+pub struct Link {
+    pub a: B,
+    pub b: B,
+    pub ha: u32,
+    pub hb: u32,
+}
+
+pub fn parse_links(chunk: B) -> Vec<Link> {
     let mut out = Vec::with_capacity(chunk.len() / 24 + 16);
     for_each_line(chunk, |line| {
         if let Some([a, b]) = fields::<2>(line) {
             if !a.is_empty() && !b.is_empty() {
-                out.push((a, b));
+                out.push(Link { a, b, ha: hash32(a), hb: hash32(b) });
             }
         }
     });

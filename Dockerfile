@@ -6,7 +6,9 @@
 FROM rust:1.100.0-slim-bookworm@sha256:7c7d4eb4d05b7781187a327809466cfddf29753f6defdc3d19a0e291951b7a37 AS builder
 WORKDIR /src
 # x86-64-v3 = AVX2, safe on every Cascade Lake or newer Xeon.
-ENV RUSTFLAGS="-C target-cpu=x86-64-v3" \
+# (the arm64 build used for quick Linux timing loops on a Mac passes --build-arg RUSTFLAGS="")
+ARG RUSTFLAGS="-C target-cpu=x86-64-v3"
+ENV RUSTFLAGS=$RUSTFLAGS \
     CARGO_TERM_COLOR=never
 # Dependencies first, so a source-only change does not rebuild them.
 COPY Cargo.toml Cargo.lock ./

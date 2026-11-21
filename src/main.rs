@@ -35,10 +35,39 @@ impl Lap {
     fn lap(&mut self, name: &str) {
         let now = Instant::now();
         if self.2 {
-            eprintln!("[{:7.3}s] {:<26} {:7.3}s", (now - self.0).as_secs_f64(), name, (now - self.1).as_secs_f64());
+            eprintln!("[{:7.3}s] {:<26} {:7.3}s  {}", (now - self.0).as_secs_f64(), name, (now - self.1).as_secs_f64(), mem_note());
         }
         self.1 = now;
     }
+}
+
+/// Linux only: anonymous vs file-backed resident memory, and the peak so far (MB).
+fn mem_note() -> String {
+    let Ok(s) = std::fs::read_to_string("/proc/self/status") else { return String::new() };
+    let get = |k: &str| -> u64 {
+        s.lines().find(|l| l.starts_with(k)).and_then(|l| l.split_whitespace().nth(1)).and_then(|v| v.parse().ok()).unwrap_or(0) / 1024
+    };
+    format!("anon {} MB, file {} MB, peak total {} MB", get("RssAnon:"), get("RssFile:"), get("VmHWM:"))
+}
+
+/// Give freed heap back to the OS (glibc keeps it in per-thread arenas otherwise).
+fn trim() {
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("NOTRIM").is_none() {
+        extern "C" {
+            fn malloc_trim(pad: usize) -> i32;
+        }
+        unsafe { malloc_trim(0) };
+    }
+}
+
+/// user and system CPU seconds of this process (Linux).
+fn cpu_note() -> String {
+    let Ok(s) = std::fs::read_to_string("/proc/self/stat") else { return String::new() };
+    let after = s.rsplit(')').next().unwrap_or("");
+    let f: Vec<&str> = after.split_whitespace().collect();
+    let t = |i: usize| f.get(i).and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0) / 100.0;
+    format!("user {:.2}s sys {:.2}s", t(11), t(12))
 }
 
 fn find(p: &mut [u32], mut x: u32) -> u32 {
@@ -67,18 +96,21 @@ fn main() {
     let ev_chunks = csv::load_chunks(&csv::list_csv(&format!("{data}/events")), CHUNK);
     let ck_chunks = csv::load_chunks(&csv::list_csv(&format!("{data}/clicks")), CHUNK);
     let lk_chunks = csv::load_chunks(&csv::list_csv(&format!("{data}/links")), CHUNK);
-    let evs: Vec<Vec<parse::Ev>> = ev_chunks.par_iter().map(|c| parse::parse_events(c, &d)).collect();
-    let cks: Vec<Vec<parse::Ck>> = ck_chunks.par_iter().map(|c| parse::parse_clicks(c, &d)).collect();
-    let lks: Vec<Vec<(B, B)>> = lk_chunks.par_iter().map(|c| parse::parse_links(c)).collect();
-    lap.lap("read+parse");
+    lap.lap("  map files");
+    let evs: Vec<Vec<Vec<parse::Ev>>> = ev_chunks.par_iter().map(|c| parse::parse_events(c, &d)).collect();
+    lap.lap("  parse events");
+    let cks: Vec<Vec<Vec<parse::Ck>>> = ck_chunks.par_iter().map(|c| parse::parse_clicks(c, &d)).collect();
+    let lks: Vec<Vec<parse::Link>> = lk_chunks.par_iter().map(|c| parse::parse_links(c)).collect();
+    lap.lap("  parse clicks+links");
 
     // ---- dedup (events: smallest ingest_ts wins, then validity of the kept copy decides)
     let ev_parts: Vec<Vec<parse::EvOut>> = dedup::dedup(&evs, |e| {
-        (e.ts != parse::INVALID).then_some(parse::EvOut { user: e.user, ts: e.ts, pay: e.pay })
+        (e.ts != parse::INVALID).then(|| e.out())
     });
     let ck_parts: Vec<Vec<parse::Ck>> = dedup::dedup(&cks, |c| Some(*c));
     drop(evs);
     drop(cks);
+    trim();
     lap.lap("dedup");
 
     // ---- links: intern every user string, union-find, name each person
@@ -89,31 +121,48 @@ fn main() {
     let n_ck = *ck_off.last().unwrap();
     let total = 2 * nl + n_ev + n_ck;
     let mut keys: Vec<B> = Vec::with_capacity(total);
+    let mut khash: Vec<u32> = Vec::with_capacity(total);
     {
         let kp = SyncPtr(keys.as_mut_ptr());
+        let hp = SyncPtr(khash.as_mut_ptr());
         let lk_off = prefix(lks.iter().map(|p| p.len() * 2));
         lks.par_iter().enumerate().for_each(|(i, v)| {
-            for (j, &(a, b)) in v.iter().enumerate() {
+            for (j, l) in v.iter().enumerate() {
                 unsafe {
-                    kp.write(lk_off[i] + 2 * j, a);
-                    kp.write(lk_off[i] + 2 * j + 1, b);
+                    kp.write(lk_off[i] + 2 * j, l.a);
+                    kp.write(lk_off[i] + 2 * j + 1, l.b);
+                    hp.write(lk_off[i] + 2 * j, l.ha);
+                    hp.write(lk_off[i] + 2 * j + 1, l.hb);
                 }
             }
         });
         ev_parts.par_iter().enumerate().for_each(|(i, v)| {
             for (j, e) in v.iter().enumerate() {
-                unsafe { kp.write(2 * nl + ev_off[i] + j, e.user) };
+                unsafe {
+                    kp.write(2 * nl + ev_off[i] + j, e.user());
+                    hp.write(2 * nl + ev_off[i] + j, e.uhash);
+                }
             }
         });
         ck_parts.par_iter().enumerate().for_each(|(i, v)| {
             for (j, c) in v.iter().enumerate() {
-                unsafe { kp.write(2 * nl + n_ev + ck_off[i] + j, c.user) };
+                unsafe {
+                    kp.write(2 * nl + n_ev + ck_off[i] + j, c.user());
+                    hp.write(2 * nl + n_ev + ck_off[i] + j, c.uhash);
+                }
             }
         });
-        unsafe { keys.set_len(total) };
+        unsafe {
+            keys.set_len(total);
+            khash.set_len(total);
+        }
     }
-    let it = intern::intern(&keys);
+    lap.lap("  gather keys");
+    let mut it = intern::intern(&keys, &khash);
+    lap.lap("  intern");
     drop(keys);
+    drop(khash);
+    trim();
     let nid = it.names.len();
     let mut parent: Vec<u32> = (0..nid as u32).collect();
     let mut size = vec![1u32; nid];
@@ -125,6 +174,7 @@ fn main() {
             size[big as usize] += size[small as usize];
         }
     }
+    lap.lap("  union-find");
     let root: Vec<u32> = (0..nid as u32).map(|x| find(&mut parent, x)).collect();
     // a person is named by the byte-wise smallest of their IDs
     let mut name_of: Vec<u32> = vec![u32::MAX; nid];
@@ -153,8 +203,11 @@ fn main() {
         unsafe { arr.set_len(n_ev) };
     }
     drop(ev_parts);
+    trim();
     arr.par_sort_unstable_by_key(|x| x.0);
     let scan = sessions::scan(&arr, ts_bits, ws);
+    let arr = if dump.is_some() { arr } else { Vec::new() };
+    trim();
     let sess: Vec<sessions::Sess> = concat_par(&scan.sessions);
     let days: Vec<sessions::UserDay> = concat_par(&scan.days);
     drop(scan);
@@ -176,12 +229,17 @@ fn main() {
         unsafe { csorted.set_len(n_ck) };
     }
     csorted.par_sort_unstable_by_key(|x| x.0);
+    let link_ids: Vec<u32> = if dump.is_some() { it.ids[..2 * nl].to_vec() } else { Vec::new() };
+    it.ids = Vec::new();
     let nc = d.camp_ids.len();
     let day0 = ws.div_euclid(MS_DAY);
     let nd = ((we - 1).div_euclid(MS_DAY) - day0 + 1).max(1) as usize;
     assert!((nc + 1) * nd < 200_000_000, "campaign x day table too large");
     let mut credited = vec![0u32; sess.len()];
     let acc = credit::credit_and_assists(&sess, &clicks, &csorted, cbits, cbase, nc, nd, &mut credited);
+    drop(csorted);
+    drop(clicks);
+    trim();
     lap.lap("credit+assists");
 
     // ---- aggregate: columns for both tables
@@ -248,9 +306,10 @@ fn main() {
 
     if let Some(dir) = dump {
         std::fs::create_dir_all(&dir).unwrap();
-        dump_stages(&dir, &d, &it, &root, &name_of, nl, &arr, ts_bits, ws, &sess, &credited);
+        dump_stages(&dir, &d, &it, &link_ids, &root, &name_of, &arr, ts_bits, ws, &sess, &credited);
     }
     if lap.2 {
+        eprintln!("cpu {}", cpu_note());
         eprintln!("total {:.3}s  events={} sessions={} clicks={} ids={}", t0.elapsed().as_secs_f64(), n_ev, sess.len(), n_ck, nid);
     }
 }
@@ -268,13 +327,13 @@ fn prefix(it: impl Iterator<Item = usize>) -> Vec<usize> {
 /// Intermediate tables for scripts/stage_check.py (only when DUMP_DIR is set).
 #[allow(clippy::too_many_arguments)]
 fn dump_stages(
-    dir: &str, d: &dims::Dims, it: &intern::Interned, root: &[u32], name_of: &[u32], nl: usize,
+    dir: &str, d: &dims::Dims, it: &intern::Interned, link_ids: &[u32], root: &[u32], name_of: &[u32],
     arr: &[(u64, u64)], ts_bits: u32, ws: i64, sess: &[sessions::Sess], credited: &[u32],
 ) {
     let pname = |p: u32| -> B { it.names[name_of[p as usize] as usize] };
     let mask = if ts_bits == 0 { 0 } else { (1u64 << ts_bits) - 1 };
     // persons: every ID that appears in a valid link line, with its person name
-    let mut seen: Vec<u32> = it.ids[..2 * nl].to_vec();
+    let mut seen: Vec<u32> = link_ids.to_vec();
     seen.sort_unstable();
     seen.dedup();
     let w = |name: &str, schema: &str, cols: Vec<Column>| {
