@@ -17,6 +17,8 @@ const SHARD_BITS: u32 = 8;
 const SHARDS: usize = 1 << SHARD_BITS;
 
 pub struct Interned {
+    /// global index of each source's first key, plus the total at the end
+    pub start: Vec<usize>,
     /// id of each input key, in input order
     pub ids: Vec<u32>,
     /// the bytes of each id
@@ -68,6 +70,7 @@ pub enum Source<'a> {
 }
 
 impl Source<'_> {
+    #[allow(dead_code)]
     pub fn count(&self) -> usize {
         match self {
             Source::Links(v) => 2 * v.len(),
@@ -99,11 +102,8 @@ impl Source<'_> {
     }
 }
 
-/// `start[k]` is the global index of source k's first key (prefix sums of the counts, one extra
-/// entry at the end). `ids[i]` is the id of the key with global index i.
-pub fn intern(sources: &[Source], start: &[usize]) -> Interned {
-    let n = *start.last().unwrap();
-    assert!(n < u32::MAX as usize);
+/// `ids[i]` is the id of the key with global index i; source k's keys start at `start[k]`.
+pub fn intern(sources: &[Source]) -> Interned {
     let ns = sources.len();
 
     // count per (source, shard), then scatter the keys into shard order
@@ -115,6 +115,14 @@ pub fn intern(sources: &[Source], start: &[usize]) -> Interned {
             c
         })
         .collect();
+    let mut start = Vec::with_capacity(ns + 1);
+    let mut n = 0usize;
+    for c in &counts {
+        start.push(n);
+        n += c.iter().map(|&x| x as usize).sum::<usize>();
+    }
+    start.push(n);
+    assert!(n < u32::MAX as usize);
     let mut offsets = vec![[0usize; SHARDS]; ns];
     let mut bounds = vec![0usize; SHARDS + 1];
     let mut run = 0usize;
@@ -193,7 +201,7 @@ pub fn intern(sources: &[Source], start: &[usize]) -> Interned {
     unsafe { ids.set_len(n) };
     drop(items);
     let keys: Vec<Key> = shard_names.into_iter().flatten().collect();
-    Interned { ids, names: materialize(&keys) }
+    Interned { start, ids, names: materialize(&keys) }
 }
 
 #[cfg(test)]
@@ -208,8 +216,7 @@ mod tests {
             rows.push(Link { a: Key::safe(a), b: Key::safe(b) });
         }
         let src = [Source::Links(&rows)];
-        let start = [0, src[0].count()];
-        let r = intern(&src, &start);
+        let r = intern(&src);
         // the odd tail key was visited twice; only the first n entries matter
         assert!(r.ids.len() >= keys.len());
         r

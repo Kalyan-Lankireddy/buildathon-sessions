@@ -24,7 +24,7 @@ use pq::Column;
 use rayon::prelude::*;
 use std::time::Instant;
 use ts::{MS_DAY, WEEK_MS};
-use util::{bits_for, concat_par, SyncPtr};
+use util::{bits_for, concat_par, sort_by_key_bucketed, SyncPtr};
 
 const CHUNK: usize = 64 << 20;
 
@@ -74,9 +74,8 @@ fn main() {
     let data = std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into());
     let out = std::env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into());
     let dump = std::env::var("DUMP_DIR").ok();
-    let threads = std::env::var("NCPU").ok().and_then(|v| v.parse().ok()).unwrap_or_else(|| {
-        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8)
-    });
+    // The pool size comes from NCPU, never from detected CPUs (a container can report the host's).
+    let threads: usize = std::env::var("NCPU").ok().and_then(|v| v.trim().parse().ok()).filter(|&n| n >= 1).unwrap_or(8);
     rayon::ThreadPoolBuilder::new().num_threads(threads).build_global().unwrap();
     let t0 = Instant::now();
     let mut lap = Lap(t0, t0, std::env::var("QUIET").is_err());
@@ -110,15 +109,14 @@ fn main() {
     let n_lk_src = sources.len();
     sources.extend(ev_slices.iter().map(|s| intern::Source::Evs(s)));
     sources.push(intern::Source::Cks(&clicks));
-    let counts: Vec<usize> = sources.par_iter().map(|s| s.count()).collect();
-    let src_off = prefix(counts.iter().copied());
     let nl: usize = lks.iter().map(|v| v.len()).sum();
+    let mut it = intern::intern(&sources);
+    let src_off = std::mem::take(&mut it.start);
     assert_eq!(src_off[n_lk_src], 2 * nl);
     let ev_base = src_off[n_lk_src];
     let ck_base = src_off[sources.len() - 1];
     let n_ev = ck_base - ev_base;
     let n_ck = clicks.len();
-    let mut it = intern::intern(&sources, &src_off);
     lap.lap("  intern");
     let nid = it.names.len();
     let mut parent: Vec<u32> = (0..nid as u32).collect();
@@ -164,7 +162,7 @@ fn main() {
     drop(ev_slices);
     drop(sources);
     drop(evs);
-    arr.par_sort_unstable_by_key(|x| x.0);
+    let arr = sort_by_key_bucketed(arr, ts_bits + pbits, pbits);
     let scan = sessions::scan(&arr, ts_bits, ws);
     let arr = if dump.is_some() { arr } else { Vec::new() };
     let sess: Vec<sessions::Sess> = concat_par(&scan.sessions);
@@ -268,16 +266,6 @@ fn main() {
         eprintln!("cpu {}", cpu_note());
         eprintln!("total {:.3}s  events={} sessions={} clicks={} ids={}", t0.elapsed().as_secs_f64(), n_ev, sess.len(), n_ck, nid);
     }
-}
-
-fn prefix(it: impl Iterator<Item = usize>) -> Vec<usize> {
-    let mut v = vec![0];
-    let mut run = 0;
-    for x in it {
-        run += x;
-        v.push(run);
-    }
-    v
 }
 
 /// Intermediate tables for scripts/stage_check.py (only when DUMP_DIR is set).

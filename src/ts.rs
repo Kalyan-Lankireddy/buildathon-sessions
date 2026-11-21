@@ -98,10 +98,33 @@ impl Default for DayCache {
 }
 
 impl DayCache {
-    /// Same answer as `parse_ts`, faster for `YYYY-MM-DDTHH:MM:SSZ`.
+    /// Same answer as `parse_ts`, faster for the F1 and F2 forms.
     #[inline]
     pub fn parse(&mut self, b: &[u8]) -> Option<i64> {
-        if b.len() == 20 && b[4] == b'-' && b[19] == b'Z' && b[10] == b'T' && b[13] == b':' && b[16] == b':' {
+        let n = b.len();
+        if (n == 20 || n == 25) && b[4] == b'-' && b[10] == b'T' && b[13] == b':' && b[16] == b':' {
+            // zone: `Z`, or `+hh:mm` / `-hh:mm`
+            let off = if n == 20 {
+                if b[19] != b'Z' {
+                    return None;
+                }
+                0
+            } else {
+                let sign = match b[19] {
+                    b'+' => 1,
+                    b'-' => -1,
+                    _ => return None,
+                };
+                if b[22] != b':' {
+                    return None;
+                }
+                let oh = num2(b, 20)?;
+                let om = num2(b, 23)?;
+                if oh > 23 || om > 59 {
+                    return None;
+                }
+                sign * (oh * 3_600_000 + om * 60_000)
+            };
             let w0 = u64::from_le_bytes(b[..8].try_into().unwrap());
             let w1 = u16::from_le_bytes(b[8..10].try_into().unwrap());
             let slot = ((w0 ^ (w0 >> 17) ^ (w1 as u64) ^ ((w1 as u64) << 5)).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 60) as usize;
@@ -125,7 +148,7 @@ impl DayCache {
             if h > 23 || mi > 59 || s > 59 {
                 return None;
             }
-            return Some(days * MS_DAY + h * 3_600_000 + mi * 60_000 + s * 1000);
+            return Some(days * MS_DAY + h * 3_600_000 + mi * 60_000 + s * 1000 - off);
         }
         parse_ts(b)
     }
@@ -202,12 +225,13 @@ mod tests {
             seed
         };
         let alphabet = b"0123456789-:TZz+ ";
-        for _ in 0..400_000 {
+        for _ in 0..600_000 {
             let s: Vec<u8> = if next() % 3 == 0 {
                 // mutate a valid timestamp
-                let mut v = format!("20{:02}-{:02}-{:02}T{:02}:{:02}:{:02}Z", 24 + next() % 6, 1 + next() % 13, 1 + next() % 32, next() % 25, next() % 61, next() % 61).into_bytes();
+                let zone = if next() % 2 == 0 { "Z".to_string() } else { format!("{}{:02}:{:02}", if next() % 2 == 0 { '+' } else { '-' }, next() % 25, next() % 61) };
+                let mut v = format!("20{:02}-{:02}-{:02}T{:02}:{:02}:{:02}{}", 24 + next() % 6, 1 + next() % 13, 1 + next() % 32, next() % 25, next() % 61, next() % 61, zone).into_bytes();
                 if next() % 4 == 0 {
-                    let i = (next() % 20) as usize;
+                    let i = (next() % v.len() as u64) as usize;
                     v[i] = alphabet[(next() % alphabet.len() as u64) as usize];
                 }
                 v
