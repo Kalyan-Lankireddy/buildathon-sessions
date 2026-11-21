@@ -1,0 +1,25 @@
+[package]
+name = "sessions"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+
+[[bin]]
+name = "sessions"
+path = "src/main.rs"
+
+[dependencies]
+memmap2 = "0.9"
+rayon = "1.10"
+rustc-hash = "2"
+memchr = "2"
+bytes = "1"
+parquet = { version = "60", default-features = false }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false
+strip = "none"

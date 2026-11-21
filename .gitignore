@@ -8,6 +8,9 @@ scratch/
 # ...except the fixture files the scripts need
 !fixtures/**/*.csv
 
+# rust
+target/
+
 # python / tooling
 .venv/
 __pycache__/

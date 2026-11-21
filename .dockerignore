@@ -1,9 +1,13 @@
+target/
+reference/
 fixtures/
 dev/
 out/
 scratch/
+scripts/
 tests/
 __pycache__/
 .pytest_cache/
 *.md
 .git
+.DS_Store
