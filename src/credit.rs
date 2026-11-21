@@ -114,7 +114,7 @@ pub fn credit_and_assists(
                     let mut m = k + 1;
                     while m < cs.len() && cs[m].0 == key {
                         let c = cs[m].1 as usize;
-                        if clicks[c].cid() < clicks[best].cid() {
+                        if clicks[c].cid().bytes() < clicks[best].cid().bytes() {
                             best = c;
                         }
                         m += 1;

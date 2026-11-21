@@ -10,24 +10,6 @@ pub fn hash_bytes(b: &[u8]) -> u64 {
     x ^ (x >> 29)
 }
 
-/// 32-bit hash for the intern tables (top 8 bits pick the shard, low bits index the table).
-#[inline]
-pub fn hash32(b: &[u8]) -> u32 {
-    let x = hash_bytes(b);
-    (x ^ (x >> 32)) as u32
-}
-
-/// Start loading the cache line at `p` (a hint; does nothing on other targets).
-#[inline(always)]
-pub fn prefetch(p: *const u8) {
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        std::arch::x86_64::_mm_prefetch(p as *const i8, std::arch::x86_64::_MM_HINT_T0)
-    };
-    #[cfg(not(target_arch = "x86_64"))]
-    let _ = p;
-}
-
 /// A raw pointer that may be shared across threads. Every use writes disjoint indexes.
 pub struct SyncPtr<T>(pub *mut T);
 unsafe impl<T> Send for SyncPtr<T> {}
@@ -44,6 +26,12 @@ impl<T> SyncPtr<T> {
     #[inline]
     pub unsafe fn write(&self, i: usize, v: T) {
         self.0.add(i).write(v)
+    }
+    /// # Safety
+    /// The range must be in bounds and used by one thread only.
+    #[inline]
+    pub unsafe fn slice_mut<'a>(&self, i: usize, n: usize) -> &'a mut [T] {
+        std::slice::from_raw_parts_mut(self.0.add(i), n)
     }
     /// # Safety
     /// Copies `n` items to index `i`; the range must be in bounds and written by one thread only.

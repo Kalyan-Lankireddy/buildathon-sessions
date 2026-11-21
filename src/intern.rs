@@ -7,12 +7,14 @@
 //! 3. shard-local ids are shifted by the shard's base to give global ids.
 
 use crate::csv::B;
-use crate::util::{prefetch, SyncPtr};
+use crate::parse::{Ck, Ev, Link};
+use crate::dedup::Rec;
+use crate::key::Key;
+use crate::util::SyncPtr;
 use rayon::prelude::*;
 
 const SHARD_BITS: u32 = 8;
 const SHARDS: usize = 1 << SHARD_BITS;
-const AHEAD: usize = 12;
 
 pub struct Interned {
     /// id of each input key, in input order
@@ -21,9 +23,32 @@ pub struct Interned {
     pub names: Vec<B>,
 }
 
+/// Give every distinct key persistent bytes (inline keys are copied into one arena).
+fn materialize(keys: &[Key]) -> Vec<B> {
+    let mut off = Vec::with_capacity(keys.len() + 1);
+    let mut run = 0usize;
+    for k in keys {
+        off.push(run);
+        run += k.len();
+    }
+    let arena: &'static mut [u8] = Box::leak(vec![0u8; run].into_boxed_slice());
+    let ap = SyncPtr(arena.as_mut_ptr());
+    let out: Vec<B> = keys
+        .par_iter()
+        .zip(off.par_iter())
+        .map(|(k, &o)| {
+            let b = k.bytes();
+            unsafe { ap.copy_in(o, b.as_ptr(), b.len()) };
+            // SAFETY: the arena is leaked and each range is written once, before it is read.
+            unsafe { std::slice::from_raw_parts(ap.0.add(o) as *const u8, b.len()) }
+        })
+        .collect();
+    out
+}
+
 #[derive(Clone, Copy)]
 struct Item {
-    key: B,
+    key: Key,
     hash: u32,
     idx: u32,
 }
@@ -33,30 +58,69 @@ fn shard(h: u32) -> usize {
     (h >> (32 - SHARD_BITS)) as usize
 }
 
-pub fn intern(keys: &[B], hashes: &[u32]) -> Interned {
-    let n = keys.len();
-    assert!(n < u32::MAX as usize && hashes.len() == n);
+/// Where keys come from. Keys are read straight from the parse records, in this order:
+/// link rows (a, then b), alive events (user), valid clicks (user).
+#[derive(Clone, Copy)]
+pub enum Source<'a> {
+    Links(&'a [Link]),
+    Evs(&'a [Ev]),
+    Cks(&'a [Ck]),
+}
 
-    // counting sort of the keys by shard
-    let nt = rayon::current_num_threads().max(1) * 4;
-    let per = n.div_ceil(nt).max(1);
-    let ranges: Vec<(usize, usize)> = (0..nt).map(|t| ((t * per).min(n), ((t + 1) * per).min(n))).collect();
-    let counts: Vec<[u32; SHARDS]> = ranges
-        .par_iter()
-        .map(|&(a, b)| {
-            let mut c = [0u32; SHARDS];
-            for &h in &hashes[a..b] {
-                c[shard(h)] += 1;
+impl Source<'_> {
+    pub fn count(&self) -> usize {
+        match self {
+            Source::Links(v) => 2 * v.len(),
+            Source::Evs(v) => v.iter().filter(|e| e.alive()).count(),
+            Source::Cks(v) => v.len(),
+        }
+    }
+
+    #[inline]
+    fn visit<G: FnMut(Key, u32)>(&self, mut g: G) {
+        match self {
+            Source::Links(v) => {
+                for l in v.iter() {
+                    g(l.a, l.a.hash32());
+                    g(l.b, l.b.hash32());
+                }
             }
+            Source::Evs(v) => {
+                for e in v.iter().filter(|e| e.alive()) {
+                    g(*e.user(), e.user().hash32());
+                }
+            }
+            Source::Cks(v) => {
+                for c in v.iter() {
+                    g(*c.user(), c.user().hash32());
+                }
+            }
+        }
+    }
+}
+
+/// `start[k]` is the global index of source k's first key (prefix sums of the counts, one extra
+/// entry at the end). `ids[i]` is the id of the key with global index i.
+pub fn intern(sources: &[Source], start: &[usize]) -> Interned {
+    let n = *start.last().unwrap();
+    assert!(n < u32::MAX as usize);
+    let ns = sources.len();
+
+    // count per (source, shard), then scatter the keys into shard order
+    let counts: Vec<[u32; SHARDS]> = sources
+        .par_iter()
+        .map(|src| {
+            let mut c = [0u32; SHARDS];
+            src.visit(|_, h| c[shard(h)] += 1);
             c
         })
         .collect();
-    let mut offsets = vec![[0usize; SHARDS]; nt];
+    let mut offsets = vec![[0usize; SHARDS]; ns];
     let mut bounds = vec![0usize; SHARDS + 1];
     let mut run = 0usize;
     for s in 0..SHARDS {
         bounds[s] = run;
-        for t in 0..nt {
+        for t in 0..ns {
             offsets[t][s] = run;
             run += counts[t][s] as usize;
         }
@@ -65,57 +129,52 @@ pub fn intern(keys: &[B], hashes: &[u32]) -> Interned {
     let mut items: Vec<Item> = Vec::with_capacity(n);
     {
         let ip = SyncPtr(items.as_mut_ptr());
-        ranges.par_iter().zip(offsets.par_iter_mut()).for_each(|(&(a, b), off)| {
-            for i in a..b {
-                let s = shard(hashes[i]);
-                unsafe { ip.write(off[s], Item { key: keys[i], hash: hashes[i], idx: i as u32 }) };
+        sources.par_iter().zip(offsets.par_iter_mut()).enumerate().for_each(|(k, (src, off))| {
+            let mut idx = start[k] as u32;
+            src.visit(|key, hash| {
+                let s = shard(hash);
+                unsafe { ip.write(off[s], Item { key, hash, idx }) };
                 off[s] += 1;
-            }
+                idx += 1;
+            });
         });
         unsafe { items.set_len(n) };
     }
 
-    // each shard builds its table and writes shard-local ids
-    let mut ids: Vec<u32> = Vec::with_capacity(n);
-    #[allow(clippy::uninit_vec)]
-    unsafe {
-        ids.set_len(n)
-    };
-    let idp = SyncPtr(ids.as_mut_ptr());
-    let shard_names: Vec<Vec<B>> = (0..SHARDS)
+    // phase A: each shard builds its table; the item's `hash` field is reused to hold its local id
+    let ip = SyncPtr(items.as_mut_ptr());
+    let shard_names: Vec<Vec<Key>> = (0..SHARDS)
         .into_par_iter()
         .map(|s| {
-            let members = &items[bounds[s]..bounds[s + 1]];
+            // SAFETY: shard s's items are touched by this thread only.
+            let members: &mut [Item] = unsafe { ip.slice_mut(bounds[s], bounds[s + 1] - bounds[s]) };
             let cap = (members.len() * 2).next_power_of_two().max(16);
             let mask = cap - 1;
             let mut slot_hash = vec![0u32; cap];
             let mut slot_id = vec![u32::MAX; cap];
-            let mut names: Vec<B> = Vec::new();
-            for (k, it) in members.iter().enumerate() {
-                if let Some(ahead) = members.get(k + AHEAD) {
-                    prefetch(ahead.key.as_ptr());
-                }
-                let mut p = (it.hash as usize) & mask;
+            let mut names: Vec<Key> = Vec::new();
+            for k in 0..members.len() {
+                let (hash, key) = (members[k].hash, members[k].key);
+                let mut p = (hash as usize) & mask;
                 let id = loop {
                     let sid = slot_id[p];
                     if sid == u32::MAX {
                         let id = names.len() as u32;
-                        names.push(it.key);
-                        slot_hash[p] = it.hash;
+                        names.push(key);
+                        slot_hash[p] = hash;
                         slot_id[p] = id;
                         break id;
                     }
-                    if slot_hash[p] == it.hash && names[sid as usize] == it.key {
+                    if slot_hash[p] == hash && names[sid as usize].same(&key) {
                         break sid;
                     }
                     p = (p + 1) & mask;
                 };
-                unsafe { idp.write(it.idx as usize, id) };
+                members[k].hash = id;
             }
             names
         })
         .collect();
-    drop(items);
 
     let mut base = vec![0u32; SHARDS];
     let mut tot = 0u32;
@@ -123,22 +182,43 @@ pub fn intern(keys: &[B], hashes: &[u32]) -> Interned {
         base[s] = tot;
         tot += shard_names[s].len() as u32;
     }
-    ids.par_iter_mut().zip(hashes.par_iter()).for_each(|(id, &h)| {
-        *id += base[shard(h)];
+    // phase B: global id = shard base + local id, written to the key's input position
+    let mut ids: Vec<u32> = Vec::with_capacity(n);
+    let idp = SyncPtr(ids.as_mut_ptr());
+    (0..SHARDS).into_par_iter().for_each(|s| {
+        for it in &items[bounds[s]..bounds[s + 1]] {
+            unsafe { idp.write(it.idx as usize, it.hash + base[s]) };
+        }
     });
-    let names: Vec<B> = shard_names.into_iter().flatten().collect();
-    Interned { ids, names }
+    unsafe { ids.set_len(n) };
+    drop(items);
+    let keys: Vec<Key> = shard_names.into_iter().flatten().collect();
+    Interned { ids, names: materialize(&keys) }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::util::hash32;
+
+    fn run(keys: &[B], _force_hash: Option<u32>) -> Interned {
+        // pairs of keys become link rows; an odd key is paired with itself
+        let mut rows = vec![];
+        for p in keys.chunks(2) {
+            let (a, b) = (p[0], *p.get(1).unwrap_or(&p[0]));
+            rows.push(Link { a: Key::safe(a), b: Key::safe(b) });
+        }
+        let src = [Source::Links(&rows)];
+        let start = [0, src[0].count()];
+        let r = intern(&src, &start);
+        // the odd tail key was visited twice; only the first n entries matter
+        assert!(r.ids.len() >= keys.len());
+        r
+    }
+
     #[test]
     fn exact() {
-        let keys: Vec<B> = vec![b"a", b"b", b"a", b"", b"b", b"ab", b"a "];
-        let hashes: Vec<u32> = keys.iter().map(|k| hash32(k)).collect();
-        let r = intern(&keys, &hashes);
+        let keys: Vec<B> = vec![b"a", b"b", b"a", b"", b"b", b"ab", b"a ", b"a "];
+        let r = run(&keys, None);
         assert_eq!(r.names.len(), 5);
         for (i, k) in keys.iter().enumerate() {
             assert_eq!(r.names[r.ids[i] as usize], *k);
@@ -150,9 +230,8 @@ mod tests {
     /// Different keys forced onto one hash must still get different ids.
     #[test]
     fn forced_collisions() {
-        let keys: Vec<B> = vec![b"x", b"y", b"x", b"z", b"y"];
-        let hashes = vec![7u32; 5];
-        let r = intern(&keys, &hashes);
+        let keys: Vec<B> = vec![b"x", b"y", b"x", b"z", b"y", b"y"];
+        let r = run(&keys, Some(7));
         assert_eq!(r.names.len(), 3);
         assert_eq!(r.ids[0], r.ids[2]);
         assert_eq!(r.ids[1], r.ids[4]);

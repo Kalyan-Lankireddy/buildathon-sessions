@@ -9,6 +9,7 @@ mod csv;
 mod dedup;
 mod dims;
 mod intern;
+mod key;
 mod parse;
 mod pq;
 mod sessions;
@@ -17,6 +18,7 @@ mod util;
 
 use bytes::Bytes;
 use csv::B;
+use dedup::Rec;
 use parquet::data_type::ByteArray;
 use pq::Column;
 use rayon::prelude::*;
@@ -48,17 +50,6 @@ fn mem_note() -> String {
         s.lines().find(|l| l.starts_with(k)).and_then(|l| l.split_whitespace().nth(1)).and_then(|v| v.parse().ok()).unwrap_or(0) / 1024
     };
     format!("anon {} MB, file {} MB, peak total {} MB", get("RssAnon:"), get("RssFile:"), get("VmHWM:"))
-}
-
-/// Give freed heap back to the OS (glibc keeps it in per-thread arenas otherwise).
-fn trim() {
-    #[cfg(target_os = "linux")]
-    if std::env::var_os("NOTRIM").is_none() {
-        extern "C" {
-            fn malloc_trim(pad: usize) -> i32;
-        }
-        unsafe { malloc_trim(0) };
-    }
 }
 
 /// user and system CPU seconds of this process (Linux).
@@ -97,72 +88,38 @@ fn main() {
     let ck_chunks = csv::load_chunks(&csv::list_csv(&format!("{data}/clicks")), CHUNK);
     let lk_chunks = csv::load_chunks(&csv::list_csv(&format!("{data}/links")), CHUNK);
     lap.lap("  map files");
-    let evs: Vec<Vec<Vec<parse::Ev>>> = ev_chunks.par_iter().map(|c| parse::parse_events(c, &d)).collect();
+    let mut evs: Vec<Vec<Vec<parse::Ev>>> = ev_chunks.par_iter().map(|c| parse::parse_events(c, &d)).collect();
     lap.lap("  parse events");
-    let cks: Vec<Vec<Vec<parse::Ck>>> = ck_chunks.par_iter().map(|c| parse::parse_clicks(c, &d)).collect();
+    let mut cks: Vec<Vec<Vec<parse::Ck>>> = ck_chunks.par_iter().map(|c| parse::parse_clicks(c, &d)).collect();
     let lks: Vec<Vec<parse::Link>> = lk_chunks.par_iter().map(|c| parse::parse_links(c)).collect();
     lap.lap("  parse clicks+links");
 
-    // ---- dedup (events: smallest ingest_ts wins, then validity of the kept copy decides)
-    let ev_parts: Vec<Vec<parse::EvOut>> = dedup::dedup(&evs, |e| {
-        (e.ts != parse::INVALID).then(|| e.out())
-    });
-    let ck_parts: Vec<Vec<parse::Ck>> = dedup::dedup(&cks, |c| Some(*c));
-    drop(evs);
+    // ---- dedup in place (events: smallest ingest_ts wins; the kept copy's validity decides)
+    dedup::dedup_in_place(&mut evs);
+    dedup::dedup_in_place(&mut cks);
+    let clicks: Vec<parse::Ck> = dedup::flatten_alive(&cks);
     drop(cks);
-    trim();
     lap.lap("dedup");
 
     // ---- links: intern every user string, union-find, name each person
+    // key order: link IDs (a, b per row), then surviving events' users, then valid clicks' users
+    let ev_slices: Vec<&[parse::Ev]> =
+        (0..parse::SHARDS).flat_map(|s| evs.iter().map(move |c| c[s].as_slice())).filter(|s| !s.is_empty()).collect();
+    let mut sources: Vec<intern::Source> = Vec::new();
+    sources.extend(lks.iter().map(|v| intern::Source::Links(v)));
+    let n_lk_src = sources.len();
+    sources.extend(ev_slices.iter().map(|s| intern::Source::Evs(s)));
+    sources.push(intern::Source::Cks(&clicks));
+    let counts: Vec<usize> = sources.par_iter().map(|s| s.count()).collect();
+    let src_off = prefix(counts.iter().copied());
     let nl: usize = lks.iter().map(|v| v.len()).sum();
-    let ev_off: Vec<usize> = prefix(ev_parts.iter().map(|p| p.len()));
-    let ck_off: Vec<usize> = prefix(ck_parts.iter().map(|p| p.len()));
-    let n_ev = *ev_off.last().unwrap();
-    let n_ck = *ck_off.last().unwrap();
-    let total = 2 * nl + n_ev + n_ck;
-    let mut keys: Vec<B> = Vec::with_capacity(total);
-    let mut khash: Vec<u32> = Vec::with_capacity(total);
-    {
-        let kp = SyncPtr(keys.as_mut_ptr());
-        let hp = SyncPtr(khash.as_mut_ptr());
-        let lk_off = prefix(lks.iter().map(|p| p.len() * 2));
-        lks.par_iter().enumerate().for_each(|(i, v)| {
-            for (j, l) in v.iter().enumerate() {
-                unsafe {
-                    kp.write(lk_off[i] + 2 * j, l.a);
-                    kp.write(lk_off[i] + 2 * j + 1, l.b);
-                    hp.write(lk_off[i] + 2 * j, l.ha);
-                    hp.write(lk_off[i] + 2 * j + 1, l.hb);
-                }
-            }
-        });
-        ev_parts.par_iter().enumerate().for_each(|(i, v)| {
-            for (j, e) in v.iter().enumerate() {
-                unsafe {
-                    kp.write(2 * nl + ev_off[i] + j, e.user());
-                    hp.write(2 * nl + ev_off[i] + j, e.uhash);
-                }
-            }
-        });
-        ck_parts.par_iter().enumerate().for_each(|(i, v)| {
-            for (j, c) in v.iter().enumerate() {
-                unsafe {
-                    kp.write(2 * nl + n_ev + ck_off[i] + j, c.user());
-                    hp.write(2 * nl + n_ev + ck_off[i] + j, c.uhash);
-                }
-            }
-        });
-        unsafe {
-            keys.set_len(total);
-            khash.set_len(total);
-        }
-    }
-    lap.lap("  gather keys");
-    let mut it = intern::intern(&keys, &khash);
+    assert_eq!(src_off[n_lk_src], 2 * nl);
+    let ev_base = src_off[n_lk_src];
+    let ck_base = src_off[sources.len() - 1];
+    let n_ev = ck_base - ev_base;
+    let n_ck = clicks.len();
+    let mut it = intern::intern(&sources, &src_off);
     lap.lap("  intern");
-    drop(keys);
-    drop(khash);
-    trim();
     let nid = it.names.len();
     let mut parent: Vec<u32> = (0..nid as u32).collect();
     let mut size = vec![1u32; nid];
@@ -194,20 +151,22 @@ fn main() {
     let mut arr: Vec<(u64, u64)> = Vec::with_capacity(n_ev);
     {
         let ap = SyncPtr(arr.as_mut_ptr());
-        ev_parts.par_iter().enumerate().for_each(|(i, v)| {
-            for (j, e) in v.iter().enumerate() {
-                let p = root[it.ids[2 * nl + ev_off[i] + j] as usize] as u64;
-                unsafe { ap.write(ev_off[i] + j, ((p << ts_bits) | (e.ts - ws) as u64, e.pay)) };
+        ev_slices.par_iter().enumerate().for_each(|(k, sl)| {
+            let mut j = src_off[n_lk_src + k] - ev_base;
+            for e in sl.iter().filter(|e| e.alive()) {
+                let p = root[it.ids[ev_base + j] as usize] as u64;
+                unsafe { ap.write(j, ((p << ts_bits) | (e.ts - ws) as u64, e.pay)) };
+                j += 1;
             }
         });
         unsafe { arr.set_len(n_ev) };
     }
-    drop(ev_parts);
-    trim();
+    drop(ev_slices);
+    drop(sources);
+    drop(evs);
     arr.par_sort_unstable_by_key(|x| x.0);
     let scan = sessions::scan(&arr, ts_bits, ws);
     let arr = if dump.is_some() { arr } else { Vec::new() };
-    trim();
     let sess: Vec<sessions::Sess> = concat_par(&scan.sessions);
     let days: Vec<sessions::UserDay> = concat_par(&scan.days);
     drop(scan);
@@ -217,13 +176,11 @@ fn main() {
     let cbase = ws - WEEK_MS;
     let cbits = bits_for((we - cbase) as u64);
     assert!(cbits + pbits <= 64, "click key does not fit in 64 bits");
-    let clicks: Vec<parse::Ck> = concat_par(&ck_parts);
-    drop(ck_parts);
     let mut csorted: Vec<(u64, u32)> = Vec::with_capacity(n_ck);
     {
         let cp = SyncPtr(csorted.as_mut_ptr());
         clicks.par_iter().enumerate().for_each(|(i, c)| {
-            let p = root[it.ids[2 * nl + n_ev + i] as usize] as u64;
+            let p = root[it.ids[ck_base + i] as usize] as u64;
             unsafe { cp.write(i, ((p << cbits) | (c.ts - cbase) as u64, i as u32)) };
         });
         unsafe { csorted.set_len(n_ck) };
@@ -239,7 +196,6 @@ fn main() {
     let acc = credit::credit_and_assists(&sess, &clicks, &csorted, cbits, cbase, nc, nd, &mut credited);
     drop(csorted);
     drop(clicks);
-    trim();
     lap.lap("credit+assists");
 
     // ---- aggregate: columns for both tables

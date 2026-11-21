@@ -53,7 +53,21 @@ fn num2(b: &[u8], i: usize) -> Option<i64> {
 /// more than 18 significant digits.
 #[inline]
 pub fn digits_i64(b: &[u8]) -> Option<i64> {
-    if b.is_empty() || !b.iter().all(|c| c.is_ascii_digit()) {
+    if b.is_empty() {
+        return None;
+    }
+    if b.len() <= 18 {
+        // one pass; 18 digits cannot overflow
+        let mut v: u64 = 0;
+        let mut bad = 0u8;
+        for &c in b {
+            let d = c.wrapping_sub(b'0');
+            bad |= (d > 9) as u8;
+            v = v * 10 + d as u64;
+        }
+        return if bad == 0 { Some(v as i64) } else { None };
+    }
+    if !b.iter().all(|c| c.is_ascii_digit()) {
         return None;
     }
     let first = b.iter().position(|&c| c != b'0').unwrap_or(b.len());
@@ -66,6 +80,55 @@ pub fn digits_i64(b: &[u8]) -> Option<i64> {
         v = v * 10 + (c - b'0') as i64;
     }
     Some(v)
+}
+
+/// Remembers the epoch day of recent `YYYY-MM-DD` prefixes, so the common F1 form needs no
+/// calendar arithmetic. Only valid dates are stored; anything else takes the strict parser.
+pub struct DayCache {
+    w0: [u64; 16],
+    w1: [u16; 16],
+    day: [i64; 16],
+}
+
+impl Default for DayCache {
+    fn default() -> Self {
+        // all-ones never equals a real date prefix
+        DayCache { w0: [u64::MAX; 16], w1: [u16::MAX; 16], day: [0; 16] }
+    }
+}
+
+impl DayCache {
+    /// Same answer as `parse_ts`, faster for `YYYY-MM-DDTHH:MM:SSZ`.
+    #[inline]
+    pub fn parse(&mut self, b: &[u8]) -> Option<i64> {
+        if b.len() == 20 && b[4] == b'-' && b[19] == b'Z' && b[10] == b'T' && b[13] == b':' && b[16] == b':' {
+            let w0 = u64::from_le_bytes(b[..8].try_into().unwrap());
+            let w1 = u16::from_le_bytes(b[8..10].try_into().unwrap());
+            let slot = ((w0 ^ (w0 >> 17) ^ (w1 as u64) ^ ((w1 as u64) << 5)).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 60) as usize;
+            let days = if self.w0[slot] == w0 && self.w1[slot] == w1 {
+                self.day[slot]
+            } else {
+                // a valid date prefix? the strict parser on midnight of that day tells us
+                let mut probe = [0u8; 20];
+                probe[..10].copy_from_slice(&b[..10]);
+                probe[10..].copy_from_slice(b"T00:00:00Z");
+                let ms = parse_iso(&probe)?;
+                let d = ms / MS_DAY;
+                self.w0[slot] = w0;
+                self.w1[slot] = w1;
+                self.day[slot] = d;
+                d
+            };
+            let h = num2(b, 11)?;
+            let mi = num2(b, 14)?;
+            let s = num2(b, 17)?;
+            if h > 23 || mi > 59 || s > 59 {
+                return None;
+            }
+            return Some(days * MS_DAY + h * 3_600_000 + mi * 60_000 + s * 1000);
+        }
+        parse_ts(b)
+    }
 }
 
 pub fn parse_ts(b: &[u8]) -> Option<i64> {
@@ -129,6 +192,33 @@ mod tests {
     }
 
     #[test]
+    fn day_cache_agrees() {
+        let mut c = DayCache::default();
+        let mut seed = 7u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let alphabet = b"0123456789-:TZz+ ";
+        for _ in 0..400_000 {
+            let s: Vec<u8> = if next() % 3 == 0 {
+                // mutate a valid timestamp
+                let mut v = format!("20{:02}-{:02}-{:02}T{:02}:{:02}:{:02}Z", 24 + next() % 6, 1 + next() % 13, 1 + next() % 32, next() % 25, next() % 61, next() % 61).into_bytes();
+                if next() % 4 == 0 {
+                    let i = (next() % 20) as usize;
+                    v[i] = alphabet[(next() % alphabet.len() as u64) as usize];
+                }
+                v
+            } else {
+                (0..(next() % 26) as usize).map(|_| alphabet[(next() % alphabet.len() as u64) as usize]).collect()
+            };
+            assert_eq!(c.parse(&s), parse_ts(&s), "{:?}", String::from_utf8_lossy(&s));
+        }
+    }
+
+    #[test]
     fn bad() {
         for s in [
             "", "2026-10-03T23:58:10", "2026-10-03t23:58:10Z", "2026-10-03 23:58:10Z", "2026-10-03T23:58:10z",
@@ -149,10 +239,12 @@ mod tests {
         let Ok(path) = std::env::var("TS_CASES") else { return };
         let text = std::fs::read_to_string(path).unwrap();
         let mut n = 0;
+        let mut cache = DayCache::default();
         for line in text.split('\n').filter(|l| !l.is_empty()) {
             let (input, want) = line.split_once('\t').unwrap();
             let want: Option<i64> = if want.is_empty() { None } else { Some(want.parse().unwrap()) };
             assert_eq!(parse_ts(input.as_bytes()), want, "input {input:?}");
+            assert_eq!(cache.parse(input.as_bytes()), want, "day cache, input {input:?}");
             n += 1;
         }
         eprintln!("checked {n} timestamp cases against the reference");
